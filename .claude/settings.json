@@ -1,0 +1,16 @@
+{
+  "enabledPlugins": {
+    "profile-product@ai-dev-setup": true,
+    "dev-core@ai-dev-setup": true,
+    "planning@ai-dev-setup": true,
+    "research@ai-dev-setup": true
+  },
+  "extraKnownMarketplaces": {
+    "ai-dev-setup": {
+      "source": {
+        "source": "github",
+        "repo": "daniyar-sadykov/ai-dev-setup"
+      }
+    }
+  }
+}
