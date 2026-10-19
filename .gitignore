@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+
+# записи сюда не пишутся, но на случай смены LESSON_RECORDS_DIR
+*.m4a
+*.txt
+!docs/*.txt
