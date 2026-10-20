@@ -64,6 +64,11 @@ FILTER_GRAPH = (
 
 LEVEL_RE = re.compile(r"lavfi\.astats\.(\d+)\.RMS_level=(\S+)")
 
+# Запись подписывает себя в метаданных, чтобы transcribe.py знал раскладку наверняка.
+# Иначе ему приходится угадывать по звуку: числом каналов разведённая запись от старой,
+# смешанной, не отличается, у обеих их два. Метка переживает копирование файла.
+RECORD_MARK = "lesson-recorder channels=mic,system"
+
 COLOR_BG = "#f4f4f4"
 COLOR_TEXT = "#1d1d1d"
 COLOR_MUTED = "#8a8a8a"
@@ -137,6 +142,7 @@ class Capture(object):
             "-f", "dshow", "-i", MIX_DEVICE,
             "-filter_complex", FILTER_GRAPH,
             "-map", "[aout]", "-c:a", "aac", "-b:a", AUDIO_BITRATE,
+            "-metadata", "comment=" + RECORD_MARK,
             "-n", self.path,
         ]
 
