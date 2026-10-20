@@ -9,6 +9,8 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -36,6 +38,15 @@ SOUND_HOLD_SEC = 3.0
 STOP_TIMEOUT_SEC = 15
 TICK_MS = 120
 CREATE_NO_WINDOW = 0x08000000
+
+# Расшифровка идёт часами, поэтому захват звука должен выигрывать у неё процессор:
+# нажал «Запись» на новый урок, пока дорасшифровывается прошлый, и запись важнее.
+# Приоритетом это решает Windows, собственная очередь не нужна.
+BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
+TRANSCRIBE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "transcribe.py")
+TRANSCRIBE_LOG_DIR = os.path.join(tempfile.gettempdir(), "lesson-recorder")
+TRANSCRIBE_POLL_SEC = 1.0
+TRANSCRIBE_ETA_AFTER_SEC = 30
 
 # Источники не склеиваются, а разводятся по каналам: микрофон сводится в моно и уходит
 # в левый канал, звук компьютера в правый. Файл остаётся один, стерео 44100. Это нужно
@@ -223,6 +234,112 @@ class Capture(object):
         return False, "ffmpeg не ответил на q, файл может быть повреждён"
 
 
+class Transcription(object):
+    """Расшифровка одной записи: отдельный процесс transcribe.py и его прогресс.
+
+    Вывод процесса идёт не в канал, а в файл в temp, и виджет перечитывает этот файл.
+    Через канал прогресс было бы читать удобнее, но тогда расшифровка не переживала бы
+    закрытия окна: читать канал стало бы некому, и дочерний процесс свалился бы на
+    первой же печати. Буферизации тут бояться нечего, transcribe.py печатает строки
+    сразу, а не пачкой при выходе.
+    """
+
+    def __init__(self, audio):
+        self.audio = audio
+        self.target = os.path.splitext(audio)[0] + ".txt"
+        self.log_path = os.path.join(
+            TRANSCRIBE_LOG_DIR, os.path.basename(os.path.splitext(audio)[0]) + ".log"
+        )
+        self.proc = None
+        self.handle = None
+        self.started_at = 0.0
+        self.offset = 0
+        self.fraction = 0.0
+        self.checked_at = 0.0
+        self.done = False
+        self.failure = None
+        self.tail = deque(maxlen=6)
+        # Остаток считается в момент, когда пришла новая доля, и дальше просто убывает
+        # по часам. Если считать его каждый раз заново, при неподвижной доле он растёт,
+        # и в окне видно, как «ещё ~2:19» превращается в «ещё ~2:30».
+        self.estimate = None
+        self.estimated_at = 0.0
+
+    def start(self):
+        os.makedirs(TRANSCRIBE_LOG_DIR, exist_ok=True)
+        self.handle = open(self.log_path, "wb")
+        self.proc = subprocess.Popen(
+            [sys.executable, TRANSCRIBE_SCRIPT, self.audio],
+            stdin=subprocess.DEVNULL,
+            stdout=self.handle,
+            stderr=self.handle,
+            creationflags=CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS,
+        )
+        self.started_at = time.monotonic()
+
+    def is_running(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def elapsed(self):
+        return time.monotonic() - self.started_at if self.started_at else 0.0
+
+    def poll(self):
+        """Дочитывает лог не чаще раза в секунду и обновляет долю и исход."""
+        now = time.monotonic()
+        if self.done or now - self.checked_at < TRANSCRIBE_POLL_SEC:
+            return
+        self.checked_at = now
+        self._read_log()
+        if self.is_running():
+            return
+        if self.handle is not None:
+            self.handle.close()
+            self.handle = None
+        self._read_log()
+        self.done = True
+        if self.proc.returncode == 0 and os.path.exists(self.target):
+            self.fraction = 1.0
+        else:
+            self.failure = self.tail[-1] if self.tail else "причина в %s" % self.log_path
+
+    def _read_log(self):
+        try:
+            with open(self.log_path, "rb") as handle:
+                handle.seek(self.offset)
+                chunk = handle.read()
+                self.offset = handle.tell()
+        except OSError:
+            return
+        for raw in chunk.decode("utf-8", "replace").splitlines():
+            line = raw.strip()
+            if line.startswith("PROGRESS "):
+                try:
+                    value = float(line.split()[1])
+                except (IndexError, ValueError):
+                    continue
+                if value > self.fraction:
+                    self.fraction = value
+                    elapsed = self.elapsed()
+                    if elapsed >= TRANSCRIBE_ETA_AFTER_SEC and value > 0.0:
+                        self.estimate = elapsed * (1.0 - value) / value
+                        self.estimated_at = time.monotonic()
+            elif line and not line.startswith("DONE "):
+                self.tail.append(line)
+
+    def summary(self):
+        """Строка для окна: процент и остаток, либо готовность, либо ошибка."""
+        name = os.path.basename(self.target)
+        if self.failure is not None:
+            return "Расшифровка не вышла: %s" % self.failure, True
+        if self.done:
+            return "Расшифровка готова, %s" % name, False
+        percent = int(self.fraction * 100)
+        if self.estimate is None:
+            return "Расшифровка %d%%" % percent, False
+        left = max(0.0, self.estimate - (time.monotonic() - self.estimated_at))
+        return "Расшифровка %d%%, ещё ~%s" % (percent, format_duration(left)), False
+
+
 class Meter(object):
     """Строка индикатора: подпись, полоса уровня, точка живого звука."""
 
@@ -269,6 +386,13 @@ class App(tk.Tk):
         self.state = "idle"          # idle, recording, stopping, error
         self.stop_result = None
 
+        # Расшифровка живёт рядом с состоянием записи, а не внутри него. В плане она
+        # была состоянием transcribing, но тогда разрешённая во время расшифровки
+        # кнопка «Запись» потребовала бы правил на каждую пару состояний. Запрещать
+        # запись урока нельзя, это худшее, что виджет может сделать, поэтому две
+        # независимые сущности: запись и расшифровка прошлой записи.
+        self.transcription = None
+
         self._build()
         self._place()
         if self.binary is None:
@@ -306,14 +430,34 @@ class App(tk.Tk):
         )
         self.status.pack(fill="x", padx=12, pady=(8, 10))
 
+        # Строка расшифровки появляется, только когда есть что показать: окно не должно
+        # держать пустую строку и расти без дела.
+        self.transcript = tk.Label(
+            self, text="", bg=COLOR_BG, fg=COLOR_MUTED,
+            font=("Segoe UI", 8), anchor="w", justify="left", wraplength=250,
+        )
+
     def _place(self):
         self.update_idletasks()
         width = max(self.winfo_reqwidth(), 276)
         height = self.winfo_reqheight()
+        self.minsize(width, 0)
         self.geometry("%dx%d+%d+%d" % (width, height, self.winfo_screenwidth() - width - 40, 60))
 
     def set_status(self, text, error=False):
         self.status.configure(text=text, fg=COLOR_REC if error else COLOR_MUTED)
+
+    def set_transcript(self, text, error=False):
+        """Строка расшифровки: прячется пустой. Окно подрастает, а не прыгает на место."""
+        if not text:
+            if self.transcript.winfo_ismapped():
+                self.transcript.pack_forget()
+                self.geometry("")
+            return
+        self.transcript.configure(text=text, fg=COLOR_REC if error else COLOR_MUTED)
+        if not self.transcript.winfo_ismapped():
+            self.transcript.pack(fill="x", padx=12, pady=(0, 10))
+            self.geometry("")
 
     def on_button(self):
         if self.state == "recording":
@@ -340,6 +484,11 @@ class App(tk.Tk):
         self.stop_result = None
         self.button.configure(text="Стоп", state="normal")
         self.set_status("Подключаюсь к устройствам")
+        # Готовую или сорванную расшифровку прошлого урока со строки убираем, а живую
+        # оставляем: она продолжает идти в фоне, и её прогресс по-прежнему виден.
+        if self.transcription is not None and self.transcription.done:
+            self.transcription = None
+            self.set_transcript("")
 
     def begin_stop(self):
         self.state = "stopping"
@@ -370,14 +519,39 @@ class App(tk.Tk):
         summary = "%s  %s  %.1f МБ" % (name, format_duration(duration), size_mb)
         if ok:
             self.set_status(summary)
+            self.start_transcription(path)
         else:
             self.set_status("%s. %s" % (message, summary), error=True)
+
+    def start_transcription(self, path):
+        """Запускается только после удачной остановки: расшифровывать битый файл незачем."""
+        if self.transcription is not None and self.transcription.is_running():
+            # Прошлая ещё идёт. Очереди нет: файл никуда не денется, запустить руками
+            # можно в любой момент, а две модели сразу не влезут в память.
+            self.set_transcript(
+                "%s ждёт: идёт расшифровка прошлой записи" % os.path.basename(path)
+            )
+            return
+        transcription = Transcription(path)
+        try:
+            transcription.start()
+        except OSError as exc:
+            self.transcription = None
+            self.set_transcript("Расшифровка не запустилась: %s" % exc, error=True)
+            return
+        self.transcription = transcription
+        self.set_transcript("Расшифровка 0%")
 
     def tick(self):
         if self.stop_result is not None:
             result = self.stop_result
             self.stop_result = None
             self.finish_stop(*result)
+
+        if self.transcription is not None:
+            self.transcription.poll()
+            text, error = self.transcription.summary()
+            self.set_transcript(text, error=error)
 
         if self.state in ("recording", "stopping") and self.capture is not None:
             capture = self.capture
@@ -402,13 +576,17 @@ class App(tk.Tk):
         self.after(TICK_MS, self.tick)
 
     def on_close(self):
+        # Расшифровку не держим и не убиваем: это отдельный процесс, он доживёт без окна
+        # и допишет .txt сам. Прогресс после закрытия виден только в файле лога.
+        transcribing = self.transcription is not None and self.transcription.is_running()
         if self.state in ("recording", "stopping"):
-            if not messagebox.askyesno(
-                "Идёт запись",
+            question = (
                 "Запись ещё идёт. Остановить её и закрыть виджет?\n"
-                "Если закрыть иначе, файл останется повреждённым.",
-                parent=self,
-            ):
+                "Если закрыть иначе, файл останется повреждённым."
+            )
+            if transcribing:
+                question += "\n\nРасшифровка прошлой записи продолжится без окна."
+            if not messagebox.askyesno("Идёт запись", question, parent=self):
                 return
             if self.state == "recording":
                 self.set_status("Закрываю файл")
@@ -416,6 +594,14 @@ class App(tk.Tk):
                 ok, message = self.capture.stop()
                 if not ok:
                     messagebox.showwarning("Остановка", message, parent=self)
+        elif transcribing:
+            if not messagebox.askyesno(
+                "Идёт расшифровка",
+                "Закрыть виджет? Расшифровка продолжится без окна и допишет\n"
+                "текстовый файл сама. Её ход останется в %s" % self.transcription.log_path,
+                parent=self,
+            ):
+                return
         self.destroy()
 
 
